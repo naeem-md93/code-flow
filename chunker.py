@@ -42,6 +42,13 @@ def _node_category(node: ast.AST) -> str:
     return "other"
 
 
+def _node_name(node: ast.AST, category: str) -> str | None:
+    """Return a human-friendly node name when one exists."""
+    if category in ("class", "function"):
+        return getattr(node, "name", None)
+    return None
+
+
 def _is_mergeable(category: str) -> bool:
     """Only import, global_var, and other chunks merge across consecutive nodes."""
     return category in ("import", "global_var", "other")
@@ -92,6 +99,7 @@ def _chunk_via_ast(path: Path, source_text: str) -> list[dict]:
 
     lines = source_text.splitlines(keepends=True)
     file_abs = str(path.resolve())
+    file_rel = str(path)
     chunks: list[dict] = []
 
     # Each group: (category, name, start_line, end_line, [nodes])
@@ -108,7 +116,7 @@ def _chunk_via_ast(path: Path, source_text: str) -> list[dict]:
             return
         src = _extract_lines(lines, group_start, group_end)
         chunks.append(
-            _make_chunk(file_abs, current_category, group_name, group_start, group_end, src)
+            _make_chunk(file_abs, file_rel, current_category, group_name, group_start, group_end, src)
         )
         current_category = None
         group_start = None
@@ -126,7 +134,7 @@ def _chunk_via_ast(path: Path, source_text: str) -> list[dict]:
             # Flush previous group, emit this node as its own chunk.
             flush_group()
             src = _extract_lines(lines, node_start, node_end)
-            chunks.append(_make_chunk(file_abs, category, name, node_start, node_end, src))
+            chunks.append(_make_chunk(file_abs, file_rel, category, name, node_start, node_end, src))
         else:
             if current_category == category:
                 # Extend current group.
@@ -170,6 +178,7 @@ def chunk_file(path: Path) -> list[dict]:
     return [
         _make_chunk(
             file_abs,
+            str(path),
             "raw_text",
             None,
             1,

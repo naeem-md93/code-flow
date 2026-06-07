@@ -10,14 +10,14 @@ Options:
 Workflow:
     1. Load db.json (or start fresh).
     2. Recursively find all .py files in the target project.
-    3. For each file:
-        a. Hash the file. Skip if hash unchanged (unless --force).
-        b. Split into semantic chunks (AST or raw-text fallback).
-        c. For each chunk:
+    3. Breadth-first phase: hash/index all files and detect changed files.
+    4. Processing phase: for each changed file:
+        a. Split into semantic chunks (AST or raw-text fallback).
+        b. For each chunk:
             - If chunk hash unchanged and already processed, skip.
             - Otherwise call process_chunk() and record the result.
-    4. Update db.json.
-    5. Print a summary.
+    5. Update db.json.
+    6. Print a summary.
 """
 
 import argparse
@@ -28,7 +28,6 @@ from db import (
     load_db,
     save_db,
     get_project,
-    get_stored_file_hash,
     set_file_record,
     set_chunks,
     get_stored_chunk_hashes,
@@ -52,27 +51,29 @@ def run(target_path: Path, force: bool = False) -> None:
     all_files = scan_files(target_path)
     print(f"Python files found : {len(all_files)}")
 
-    files_scanned = 0
-    files_changed = 0
+    # Phase 1 (breadth-first): hash/index all files and compute changed files.
+    if force:
+        changed_files = []
+        for path in all_files:
+            current_hash = hash_file(path)
+            record = build_file_record(path, target_path, current_hash)
+            changed_files.append((path, current_hash, record))
+    else:
+        changed_files = find_changed_files(db, project_key, all_files, target_path)
+
+    print(f"Files changed     : {len(changed_files)}")
+
+    files_scanned = len(all_files)
+    files_changed = len(changed_files)
     chunks_total = 0
     chunks_processed = 0
     chunks_skipped = 0
 
-    for path in all_files:
-        files_scanned += 1
+    # Phase 2: chunk/process only files that are new or changed.
+    for path, _current_hash, record in changed_files:
         abs_path = str(path.resolve())
-        current_hash = hash_file(path)
-
-        stored_hash = get_stored_file_hash(db, project_key, abs_path)
-
-        if not force and current_hash == stored_hash:
-            # File unchanged — nothing to do for this file.
-            continue
-
-        files_changed += 1
 
         # Build and store the updated file record.
-        record = build_file_record(path, target_path, current_hash)
         set_file_record(db, project_key, record)
 
         # Chunk the file.
