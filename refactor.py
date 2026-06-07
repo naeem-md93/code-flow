@@ -1,0 +1,147 @@
+"""
+refactor.py — CLI entry point for the Python project refactoring tool.
+
+Usage:
+    python refactor.py /path/to/target/project [--force]
+
+Options:
+    --force    Re-process all chunks even if already marked as processed.
+
+Workflow:
+    1. Load db.json (or start fresh).
+    2. Recursively find all .py files in the target project.
+    3. For each file:
+        a. Hash the file. Skip if hash unchanged (unless --force).
+        b. Split into semantic chunks (AST or raw-text fallback).
+        c. For each chunk:
+            - If chunk hash unchanged and already processed, skip.
+            - Otherwise call process_chunk() and record the result.
+    4. Update db.json.
+    5. Print a summary.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+from db import (
+    load_db,
+    save_db,
+    get_project,
+    get_stored_file_hash,
+    set_file_record,
+    set_chunks,
+    get_stored_chunk_hashes,
+)
+from scanner import scan_files, hash_file, build_file_record, find_changed_files
+from chunker import chunk_file
+from processor import process_chunk
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+def run(target_path: Path, force: bool = False) -> None:
+    project_key = str(target_path.resolve())
+    print(f"Target project : {project_key}")
+
+    db = load_db()
+    get_project(db, project_key)  # ensure project entry exists
+
+    all_files = scan_files(target_path)
+    print(f"Python files found : {len(all_files)}")
+
+    files_scanned = 0
+    files_changed = 0
+    chunks_total = 0
+    chunks_processed = 0
+    chunks_skipped = 0
+
+    for path in all_files:
+        files_scanned += 1
+        abs_path = str(path.resolve())
+        current_hash = hash_file(path)
+
+        stored_hash = get_stored_file_hash(db, project_key, abs_path)
+
+        if not force and current_hash == stored_hash:
+            # File unchanged — nothing to do for this file.
+            continue
+
+        files_changed += 1
+
+        # Build and store the updated file record.
+        record = build_file_record(path, target_path, current_hash)
+        set_file_record(db, project_key, record)
+
+        # Chunk the file.
+        try:
+            new_chunks = chunk_file(path)
+        except RuntimeError as exc:
+            print(f"  [WARN] Could not chunk {abs_path}: {exc}", file=sys.stderr)
+            continue
+
+        # Compare chunk hashes to avoid re-processing unchanged chunks.
+        old_hashes = get_stored_chunk_hashes(db, project_key, abs_path)
+
+        for chunk in new_chunks:
+            chunks_total += 1
+            cid = chunk["chunk_id"]
+            old_hash = old_hashes.get(cid)
+
+            if not force and old_hash == chunk["hash"] and chunk.get("processed"):
+                # Chunk unchanged and already processed — preserve old result.
+                chunks_skipped += 1
+                continue
+
+            result = process_chunk(chunk)
+            chunk["result"] = result
+            chunk["processed"] = True
+            chunks_processed += 1
+
+        set_chunks(db, project_key, abs_path, new_chunks)
+
+    save_db(db)
+
+    # Summary
+    print("-" * 50)
+    print(f"Files scanned    : {files_scanned}")
+    print(f"Files changed    : {files_changed}")
+    print(f"Chunks total     : {chunks_total}")
+    print(f"Chunks processed : {chunks_processed}")
+    print(f"Chunks skipped   : {chunks_skipped}")
+    print(f"Database saved   : db.json")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Refactor a Python project: scan, chunk, and process all .py files."
+    )
+    parser.add_argument(
+        "target_path",
+        type=str,
+        help="Absolute or relative path to the target Python project directory.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Re-process all chunks even if already marked as processed.",
+    )
+    args = parser.parse_args()
+
+    target = Path(args.target_path).expanduser().resolve()
+    if not target.is_dir():
+        print(f"Error: '{target}' is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    run(target, force=args.force)
+
+
+if __name__ == "__main__":
+    main()
