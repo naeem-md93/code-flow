@@ -47,12 +47,6 @@ def _is_mergeable(category: str) -> bool:
     return category in ("import", "global_var", "other")
 
 
-def _node_name(node: ast.AST, category: str) -> str | None:
-    if category in ("class", "function"):
-        return getattr(node, "name", None)
-    return None
-
-
 def _extract_lines(lines: list[str], start_line: int, end_line: int) -> str:
     """Extract source lines (1-based, inclusive). Strips trailing blank lines."""
     segment = "".join(lines[start_line - 1 : end_line])
@@ -60,18 +54,22 @@ def _extract_lines(lines: list[str], start_line: int, end_line: int) -> str:
 
 
 def _make_chunk(
-    file_abs: str,
+    abs_path: str,
+    rel_path: str,
     chunk_type: str,
     name: str | None,
     start_line: int,
     end_line: int,
     source: str,
 ) -> dict:
-    chunk_id = f"{file_abs}::{chunk_type}::{name or ''}::{start_line}"
+    
+    hash_source = _hash_source(source)
+    chunk_id = f"{abs_path}::{start_line}::{end_line}::{hash_source}"
     return {
         "chunk_id": chunk_id,
         "type": chunk_type,
-        "name": name,
+        "abs_path": abs_path,
+        "rel_path": rel_path,
         "start_line": start_line,
         "end_line": end_line,
         "source": source,
