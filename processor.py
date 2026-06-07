@@ -1,5 +1,5 @@
 """
-processor.py — Placeholder chunk processor.
+processor.py — Chunk processor.
 
 Each chunk dict has the shape:
   {
@@ -14,24 +14,24 @@ Each chunk dict has the shape:
     "result":     any,
   }
 
-Implement process_chunk() to perform whatever transformation or analysis
-is needed. Return any JSON-serialisable value; it will be stored in
-chunk["result"] and chunk["processed"] will be set to True.
+process_chunk() builds a dependency graph payload for each chunk.
 """
 
+from graph_builder import extract_chunk_graph
 
-def process_chunk(chunk: dict):
+
+def process_chunk(chunk: dict, project_name: str):
     """
     Process a single chunk.
 
-    TODO: replace this stub with real logic.
-
     Args:
         chunk: the chunk dict (read-only; do not mutate it here).
+      project_name: target project root node label.
 
     Returns:
         A JSON-serialisable result that will be stored in chunk["result"].
-        Return None to indicate no result yet.
     """
-    # --- placeholder ---
-    return None
+      graph = extract_chunk_graph(chunk, project_name=project_name)
+      return {
+        "graph": graph,
+      }

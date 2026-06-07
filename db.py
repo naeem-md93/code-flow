@@ -29,6 +29,43 @@ Schema (keyed by target project absolute path):
           }
         }
       }
+            }
+        },
+        "graph": {
+            "by_file": {
+                "/abs/path/file.py": {
+                    "nodes": [
+                        {
+                            "id": "symbol-id",
+                            "label": "symbol-label",
+                            "kind": "project|module|symbol",
+                            "file": "/abs/path/file.py"
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "source": "source-id",
+                            "target": "target-id",
+                            "type": "import|hierarchy|usage|call",
+                            "file": "/abs/path/file.py"
+                        }
+                    ]
+                }
+            },
+            "nodes": [
+                {
+                    "id": "symbol-id",
+                    "label": "symbol-label",
+                    "kind": "project|module|symbol"
+                }
+            ],
+            "edges": [
+                {
+                    "source": "source-id",
+                    "target": "target-id",
+                    "type": "import|hierarchy|usage|call"
+                }
+            ]
     }
   }
 }
@@ -61,10 +98,14 @@ def save_db(db: dict) -> None:
 def get_project(db: dict, project_path: str) -> dict:
     """Return the sub-dict for a project, creating it if absent."""
     if project_path not in db:
-        db[project_path] = {"files": {}, "chunks": {}}
+        db[project_path] = {"files": {}, "chunks": {}, "graph": {}}
     entry = db[project_path]
     entry.setdefault("files", {})
     entry.setdefault("chunks", {})
+    graph = entry.setdefault("graph", {})
+    graph.setdefault("by_file", {})
+    graph.setdefault("nodes", [])
+    graph.setdefault("edges", [])
     return entry
 
 
@@ -140,3 +181,67 @@ def get_stored_chunk_hashes(db: dict, project_path: str, abs_path: str) -> dict[
         for chunk_id, chunk in chunks.items()
         if isinstance(chunk, dict)
     }
+
+
+# ---------------------------------------------------------------------------
+# Graph helpers
+# ---------------------------------------------------------------------------
+
+def get_graph(db: dict, project_path: str) -> dict:
+    """Return the project graph table, creating it if absent."""
+    project = get_project(db, project_path)
+    graph = project.setdefault("graph", {})
+    graph.setdefault("by_file", {})
+    graph.setdefault("nodes", [])
+    graph.setdefault("edges", [])
+    return graph
+
+
+def set_file_graph(db: dict, project_path: str, abs_path: str, nodes: list[dict], edges: list[dict]) -> None:
+    """Replace graph contribution for a single file, then rebuild aggregate graph."""
+    graph = get_graph(db, project_path)
+    graph["by_file"][abs_path] = {
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+def rebuild_project_graph(db: dict, project_path: str) -> None:
+    """Recompute deduplicated project-level graph from per-file graph entries."""
+    graph = get_graph(db, project_path)
+    by_file = graph.get("by_file", {})
+
+    nodes_by_id: dict[str, dict] = {}
+    edges_by_key: dict[str, dict] = {}
+
+    for file_graph in by_file.values():
+        for node in file_graph.get("nodes", []):
+            node_id = node.get("id")
+            if not node_id:
+                continue
+            if node_id not in nodes_by_id:
+                nodes_by_id[node_id] = {
+                    "id": node_id,
+                    "label": node.get("label", node_id),
+                    "kind": node.get("kind", "symbol"),
+                }
+
+        for edge in file_graph.get("edges", []):
+            src = edge.get("source")
+            dst = edge.get("target")
+            edge_type = edge.get("type", "usage")
+            if not src or not dst:
+                continue
+            key = f"{src}::{dst}::{edge_type}"
+            if key not in edges_by_key:
+                edges_by_key[key] = {
+                    "source": src,
+                    "target": dst,
+                    "type": edge_type,
+                }
+
+    graph["nodes"] = sorted(nodes_by_id.values(), key=lambda n: n["id"])
+    graph["edges"] = sorted(
+        edges_by_key.values(),
+        key=lambda e: (e["source"], e["target"], e["type"]),
+    )

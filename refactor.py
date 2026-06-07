@@ -28,8 +28,11 @@ from db import (
     load_db,
     save_db,
     get_project,
+    get_chunks,
     set_file_record,
     set_chunks,
+    set_file_graph,
+    rebuild_project_graph,
     get_stored_chunk_hashes,
 )
 from scanner import scan_files, hash_file, build_file_record, find_changed_files
@@ -43,6 +46,7 @@ from processor import process_chunk
 
 def run(target_path: Path, force: bool = False) -> None:
     project_key = str(target_path.resolve())
+    project_name = target_path.resolve().name
     print(f"Target project : {project_key}")
 
     db = load_db()
@@ -85,23 +89,55 @@ def run(target_path: Path, force: bool = False) -> None:
 
         # Compare chunk hashes to avoid re-processing unchanged chunks.
         old_hashes = get_stored_chunk_hashes(db, project_key, abs_path)
+        old_chunks = get_chunks(db, project_key, abs_path)
 
         for chunk in new_chunks:
             chunks_total += 1
             cid = chunk["chunk_id"]
             old_hash = old_hashes.get(cid)
+            old_chunk = old_chunks.get(cid, {}) if isinstance(old_chunks, dict) else {}
+            old_processed = bool(old_chunk.get("processed", False))
 
-            if not force and old_hash == chunk["hash"] and chunk.get("processed"):
+            if not force and old_hash == chunk["hash"] and old_processed:
                 # Chunk unchanged and already processed — preserve old result.
+                chunk["result"] = old_chunk.get("result")
+                chunk["processed"] = old_processed
                 chunks_skipped += 1
                 continue
 
-            result = process_chunk(chunk)
+            result = process_chunk(chunk, project_name=project_name)
             chunk["result"] = result
             chunk["processed"] = True
             chunks_processed += 1
 
+        file_nodes: dict[str, dict] = {}
+        file_edges: dict[str, dict] = {}
+        for chunk in new_chunks:
+            graph = (chunk.get("result") or {}).get("graph", {})
+            for node in graph.get("nodes", []):
+                node_id = node.get("id")
+                if node_id and node_id not in file_nodes:
+                    file_nodes[node_id] = node
+            for edge in graph.get("edges", []):
+                src = edge.get("source")
+                dst = edge.get("target")
+                edge_type = edge.get("type")
+                if not src or not dst or not edge_type:
+                    continue
+                edge_key = f"{src}::{dst}::{edge_type}"
+                if edge_key not in file_edges:
+                    file_edges[edge_key] = edge
+
+        set_file_graph(
+            db,
+            project_key,
+            abs_path,
+            list(file_nodes.values()),
+            list(file_edges.values()),
+        )
         set_chunks(db, project_key, abs_path, new_chunks)
+
+    rebuild_project_graph(db, project_key)
 
     save_db(db)
 
