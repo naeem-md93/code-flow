@@ -17,7 +17,13 @@ Each chunk dict has the shape:
 process_chunk() builds a dependency graph payload for each chunk.
 """
 
-from graph_builder import extract_chunk_graph, extract_import_chunk_graph
+from graph_builder import (
+    extract_chunk_graph,
+    extract_import_chunk_graph,
+    extract_global_var_chunk_graph,
+    extract_function_chunk_graph,
+    extract_class_chunk_graph,
+)
 
 
 def process_chunk(chunk: dict, project_name: str):
@@ -31,11 +37,17 @@ def process_chunk(chunk: dict, project_name: str):
     Returns:
         A JSON-serialisable result that will be stored in chunk["result"].
     """
-    if chunk.get("type") == "import":
+    chunk_type = chunk.get("type")
+    if chunk_type == "import":
         graph = extract_import_chunk_graph(chunk)
+    elif chunk_type == "global_var":
+        graph = extract_global_var_chunk_graph(chunk)
+    elif chunk_type == "function":
+        graph = extract_function_chunk_graph(chunk)
+    elif chunk_type == "class":
+        graph = extract_class_chunk_graph(chunk)
     else:
         graph = {}
-    #     graph = extract_chunk_graph(chunk, project_name=project_name)
     return {
         "graph": graph,
     }

@@ -341,3 +341,286 @@ def extract_import_chunk_graph(chunk: dict) -> dict:
             key=lambda e: (e["source"], e["target"], e["type"]),
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Global-var chunk graph
+# ---------------------------------------------------------------------------
+
+def _rel_path_parts(rel_path: str) -> list[str]:
+    """
+    Convert a relative file path to a list of dotted-chain parts.
+
+    Example: 'code_flow/graph_builder.py' -> ['code_flow', 'graph_builder']
+    """
+    return list(Path(rel_path).with_suffix("").parts)
+
+
+def extract_global_var_chunk_graph(chunk: dict) -> dict:
+    """
+    Build a chain graph for a global_var chunk.
+
+    Each defined variable is linked to the file that defines it:
+        pkg -> pkg.module -> pkg.module.VAR_NAME
+
+    Edge types
+    ----------
+    ``"submodule"`` -- between path segments (pkg -> pkg.module)
+    ``"defines"``   -- from module node to variable node
+
+    Returns
+    -------
+    {
+      "nodes": [ {"id", "label", "kind", "file"}, ... ],
+      "edges": [ {"source", "target", "type", "file"}, ... ],
+      "module": module_name,
+    }
+    """
+    source = chunk.get("source", "")
+    abs_path = chunk.get("abs_path", "")
+    rel_path = chunk.get("rel_path", "") or abs_path
+    module_name = _module_label(abs_path)
+
+    nodes_by_id: dict[str, dict] = {}
+    edges_by_key: dict[str, dict] = {}
+
+    tree = _safe_parse(source)
+    if tree is None:
+        return {"module": module_name, "nodes": [], "edges": []}
+
+    var_names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            var_names.update(_extract_assigned_names(node))
+
+    if not var_names:
+        return {"module": module_name, "nodes": [], "edges": []}
+
+    path_parts = _rel_path_parts(rel_path)
+    if not path_parts:
+        path_parts = [module_name]
+
+    last_module_id = _build_dotted_chain(path_parts, nodes_by_id, edges_by_key, abs_path)
+
+    for var in sorted(var_names):
+        var_id = f"{last_module_id}.{var}"
+        _add_node(nodes_by_id, var_id, var, "variable", abs_path)
+        _add_edge(edges_by_key, last_module_id, var_id, "defines", abs_path)
+
+    return {
+        "module": module_name,
+        "nodes": sorted(nodes_by_id.values(), key=lambda n: n["id"]),
+        "edges": sorted(
+            edges_by_key.values(),
+            key=lambda e: (e["source"], e["target"], e["type"]),
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Function-chunk graph
+# ---------------------------------------------------------------------------
+
+def extract_function_chunk_graph(chunk: dict) -> dict:
+    """
+    Build a chain graph for a function chunk.
+
+    The function name is linked to the file that defines it:
+        pkg -> pkg.module -> pkg.module.func_name
+
+    Edge types
+    ----------
+    ``"submodule"`` -- between path segments (pkg -> pkg.module)
+    ``"defines"``   -- from module node to function node
+
+    Returns
+    -------
+    {
+      "nodes": [ {"id", "label", "kind", "file"}, ... ],
+      "edges": [ {"source", "target", "type", "file"}, ... ],
+      "module": module_name,
+    }
+    """
+    abs_path = chunk.get("abs_path", "")
+    rel_path = chunk.get("rel_path", "") or abs_path
+    module_name = _module_label(abs_path)
+    func_name = chunk.get("name")
+
+    if not func_name:
+        return {"module": module_name, "nodes": [], "edges": []}
+
+    nodes_by_id: dict[str, dict] = {}
+    edges_by_key: dict[str, dict] = {}
+
+    path_parts = _rel_path_parts(rel_path)
+    if not path_parts:
+        path_parts = [module_name]
+
+    last_module_id = _build_dotted_chain(path_parts, nodes_by_id, edges_by_key, abs_path)
+
+    func_id = f"{last_module_id}.{func_name}"
+    _add_node(nodes_by_id, func_id, func_name, "function", abs_path)
+    _add_edge(edges_by_key, last_module_id, func_id, "defines", abs_path)
+
+    return {
+        "module": module_name,
+        "nodes": sorted(nodes_by_id.values(), key=lambda n: n["id"]),
+        "edges": sorted(
+            edges_by_key.values(),
+            key=lambda e: (e["source"], e["target"], e["type"]),
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Class-chunk graph
+# ---------------------------------------------------------------------------
+
+def _build_import_map(tree: ast.AST) -> dict[str, str]:
+    """
+    Build a mapping from local name -> fully-qualified dotted path for every
+    imported name visible in *tree*.
+
+    Examples
+    --------
+    ``from code_flow.base import BaseBuilder``  ->  {"BaseBuilder": "code_flow.base.BaseBuilder"}
+    ``import os``                               ->  {"os": "os"}
+    ``import numpy as np``                      ->  {"np": "numpy"}
+    """
+    import_map: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            module_str = node.module or ""
+            if not module_str:
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local_name = alias.asname or alias.name
+                import_map[local_name] = f"{module_str}.{alias.name}"
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                local_name = alias.asname or alias.name.split(".")[0]
+                import_map[local_name] = alias.name
+    return import_map
+
+
+def _base_qualified_id(base: ast.expr, import_map: dict[str, str]) -> str | None:
+    """
+    Resolve a base-class AST expression to its fully-qualified dotted id,
+    or None if it cannot be resolved via the import map.
+    """
+    if isinstance(base, ast.Name):
+        return import_map.get(base.id)
+    if isinstance(base, ast.Attribute):
+        parts: list[str] = []
+        current: ast.expr = base
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name):
+            parts.append(current.id)
+            dotted = ".".join(reversed(parts))
+            return import_map.get(dotted, dotted)
+    return None
+
+
+def extract_class_chunk_graph(chunk: dict) -> dict:
+    """
+    Build a graph for a class chunk.
+
+    Covers
+    ------
+    - Module path chain:  pkg -> pkg.module -> pkg.module.ClassName
+    - Base class chains:  resolved via imports -> inherits edge to subclass
+    - Methods:            ClassName -> ClassName.method_name  (defines)
+    - Instance variables: from self.x = ... in __init__     (defines)
+
+    Returns
+    -------
+    {
+      "nodes": [ {"id", "label", "kind", "file"}, ... ],
+      "edges": [ {"source", "target", "type", "file"}, ... ],
+      "module": module_name,
+    }
+    """
+    source = chunk.get("source", "")
+    abs_path = chunk.get("abs_path", "")
+    rel_path = chunk.get("rel_path", "") or abs_path
+    module_name = _module_label(abs_path)
+    class_name = chunk.get("name")
+
+    if not class_name:
+        return {"module": module_name, "nodes": [], "edges": []}
+
+    nodes_by_id: dict[str, dict] = {}
+    edges_by_key: dict[str, dict] = {}
+
+    tree = _safe_parse(source)
+    if tree is None:
+        return {"module": module_name, "nodes": [], "edges": []}
+
+    import_map = _build_import_map(tree)
+
+    # Module path chain -> class node
+    path_parts = _rel_path_parts(rel_path)
+    if not path_parts:
+        path_parts = [module_name]
+    last_module_id = _build_dotted_chain(path_parts, nodes_by_id, edges_by_key, abs_path)
+
+    class_id = f"{last_module_id}.{class_name}"
+    _add_node(nodes_by_id, class_id, class_name, "class", abs_path)
+    _add_edge(edges_by_key, last_module_id, class_id, "defines", abs_path)
+
+    # Locate the ClassDef node
+    class_def: ast.ClassDef | None = None
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            class_def = node
+            break
+
+    if class_def is None:
+        return {
+            "module": module_name,
+            "nodes": sorted(nodes_by_id.values(), key=lambda n: n["id"]),
+            "edges": sorted(edges_by_key.values(), key=lambda e: (e["source"], e["target"], e["type"])),
+        }
+
+    # Base class chains
+    for base in class_def.bases:
+        qualified = _base_qualified_id(base, import_map)
+        if not qualified:
+            continue
+        base_parts = qualified.split(".")
+        base_last_id = _build_dotted_chain(base_parts, nodes_by_id, edges_by_key, abs_path)
+        _add_edge(edges_by_key, base_last_id, class_id, "inherits", abs_path)
+
+    # Methods and instance variables
+    for item in class_def.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            method_id = f"{class_id}.{item.name}"
+            _add_node(nodes_by_id, method_id, item.name, "function", abs_path)
+            _add_edge(edges_by_key, class_id, method_id, "defines", abs_path)
+
+            if item.name == "__init__":
+                for stmt in ast.walk(item):
+                    if not isinstance(stmt, ast.Assign):
+                        continue
+                    for target in stmt.targets:
+                        if (
+                            isinstance(target, ast.Attribute)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id == "self"
+                        ):
+                            var_id = f"{class_id}.{target.attr}"
+                            _add_node(nodes_by_id, var_id, target.attr, "variable", abs_path)
+                            _add_edge(edges_by_key, class_id, var_id, "defines", abs_path)
+
+    return {
+        "module": module_name,
+        "nodes": sorted(nodes_by_id.values(), key=lambda n: n["id"]),
+        "edges": sorted(
+            edges_by_key.values(),
+            key=lambda e: (e["source"], e["target"], e["type"]),
+        ),
+    }
