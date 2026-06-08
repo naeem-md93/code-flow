@@ -246,3 +246,98 @@ def extract_chunk_graph(chunk: dict, project_name: str) -> dict:
             key=lambda e: (e["source"], e["target"], e["type"]),
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Import-chunk graph
+# ---------------------------------------------------------------------------
+
+def _build_dotted_chain(
+    parts: list[str],
+    nodes_by_id: dict[str, dict],
+    edges_by_key: dict[str, dict],
+    abs_path: str,
+) -> str:
+    """
+    Create a node for each dotted segment, linking them with 'submodule' edges.
+    Returns the qualified id of the last node (e.g. 'a.b.c').
+    """
+    qualified = ""
+    prev_id: str | None = None
+    for part in parts:
+        qualified = f"{qualified}.{part}" if qualified else part
+        _add_node(nodes_by_id, qualified, part, "module", abs_path)
+        if prev_id is not None:
+            _add_edge(edges_by_key, prev_id, qualified, "submodule", abs_path)
+        prev_id = qualified
+    return qualified  # id of the last segment
+
+
+def extract_import_chunk_graph(chunk: dict) -> dict:
+    """
+    Build a chain graph for an import-type chunk.
+
+    Rules
+    -----
+    ``import a.b.c``          →  a → b → c          (submodule edges)
+    ``import numpy as np``    →  numpy → numpy@np    (alias edge)
+    ``from a.b import C``     →  a → b → a.b.C      (submodule + import edges)
+    ``from a.b import C as D``→  a → b → a.b.C → a.b.C@D  (+ alias edge)
+    Wildcard imports (``from x import *``) are skipped silently.
+
+    Returns
+    -------
+    {
+      "nodes": [ {"id", "label", "kind", "file"}, ... ],
+      "edges": [ {"source", "target", "type", "file"}, ... ],
+      "module": module_name,
+    }
+    """
+    source = chunk.get("source", "")
+    abs_path = chunk.get("abs_path", "")
+    module_name = _module_label(abs_path)
+
+    nodes_by_id: dict[str, dict] = {}
+    edges_by_key: dict[str, dict] = {}
+
+    tree = _safe_parse(source)
+    if tree is None:
+        return {"module": module_name, "nodes": [], "edges": []}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                parts = alias.name.split(".")
+                last_id = _build_dotted_chain(parts, nodes_by_id, edges_by_key, abs_path)
+                if alias.asname:
+                    alias_id = f"{last_id}@{alias.asname}"
+                    _add_node(nodes_by_id, alias_id, alias.asname, "alias", abs_path)
+                    _add_edge(edges_by_key, last_id, alias_id, "alias", abs_path)
+
+        elif isinstance(node, ast.ImportFrom):
+            module_parts = (node.module or "").split(".")
+            if not module_parts or not module_parts[0]:
+                continue
+
+            last_module_id = _build_dotted_chain(module_parts, nodes_by_id, edges_by_key, abs_path)
+            qualified_module = last_module_id  # e.g. "pathlib" or "a.b"
+
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                name_id = f"{qualified_module}.{alias.name}"
+                _add_node(nodes_by_id, name_id, alias.name, "module", abs_path)
+                _add_edge(edges_by_key, last_module_id, name_id, "import", abs_path)
+                if alias.asname:
+                    alias_id = f"{name_id}@{alias.asname}"
+                    _add_node(nodes_by_id, alias_id, alias.asname, "alias", abs_path)
+                    _add_edge(edges_by_key, name_id, alias_id, "alias", abs_path)
+
+    return {
+        "module": module_name,
+        "nodes": sorted(nodes_by_id.values(), key=lambda n: n["id"]),
+        "edges": sorted(
+            edges_by_key.values(),
+            key=lambda e: (e["source"], e["target"], e["type"]),
+        ),
+    }
