@@ -38,6 +38,7 @@ from db import (
 from scanner import scan_files, hash_file, build_file_record, find_changed_files
 from chunker import chunk_file
 from processor import process_chunk
+from graph_export import export_gexf
 
 
 # ---------------------------------------------------------------------------
@@ -139,11 +140,21 @@ def run(target_path: Path, force: bool = False) -> None:
 
     rebuild_project_graph(db, project_key)
 
+    # Export project graph to GEXF.
+    project_graph = db.get(project_key, {}).get("graph", {})
+    gexf_path = Path(__file__).parent / f"{project_name}.gexf"
+    export_gexf(
+        project_graph.get("nodes", []),
+        project_graph.get("edges", []),
+        gexf_path,
+    )
+
     save_db(db)
 
     # Summary
     print("-" * 50)
     print(f"Files scanned    : {files_scanned}")
+    print(f"Graph exported   : {gexf_path}")
     print(f"Files changed    : {files_changed}")
     print(f"Chunks total     : {chunks_total}")
     print(f"Chunks processed : {chunks_processed}")
